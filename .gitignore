@@ -1,2 +1,5 @@
 *.pyc
-output/
+/output/
+/example/
+/example_old/
+/output_old/

@@ -299,17 +299,6 @@ def main():
     normal_ball, mask_ball = get_ideal_normal_ball(size=args.ball_size+args.ball_dilate)
     _, mask_ball_for_crop = get_ideal_normal_ball(size=args.ball_size)
     
-    
-    # make output directory if not exist
-    raw_output_dir = os.path.join(args.output_dir, "raw")
-    control_output_dir = os.path.join(args.output_dir, "control")
-    square_output_dir = os.path.join(args.output_dir, "square")
-    os.makedirs(args.output_dir, exist_ok=True)    
-    os.makedirs(raw_output_dir, exist_ok=True)
-    if args.save_control:
-        os.makedirs(control_output_dir, exist_ok=True)
-    os.makedirs(square_output_dir, exist_ok=True)
-    
     # create split seed
     # please DO NOT manual replace this line, use --seed option instead
     seeds = args.seed.split(",")
@@ -325,7 +314,19 @@ def main():
         for ev, (prompt_embeds, pooled_prompt_embeds) in embedding_dict.items():
             # create output file name (we always use png to prevent quality loss)
             ev_str = str(ev).replace(".", "") if ev != 0 else "-00"
-            outname = os.path.basename(image_path).split(".")[0] + f"_ev{ev_str}"
+            relative_path = os.path.relpath(image_path, args.dataset)
+            dir_path = os.path.dirname(relative_path)
+            image_name, _ = os.path.splitext(os.path.basename(image_path))
+            outname = image_name + f"_ev{ev_str}"
+
+            # make output directory if not exist
+            raw_output_dir = os.path.join(args.output_dir, dir_path, "raw")
+            control_output_dir = os.path.join(args.output_dir, dir_path, "control")
+            square_output_dir = os.path.join(args.output_dir, dir_path, "square")
+            os.makedirs(raw_output_dir, exist_ok=True)
+            if args.save_control:
+                os.makedirs(control_output_dir, exist_ok=True)
+            os.makedirs(square_output_dir, exist_ok=True)
 
             # we use top-left corner notation (which is different from aj.aek's center point notation)
             x, y, r = get_ball_location(image_data, args)

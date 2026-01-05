@@ -82,7 +82,9 @@ class GeneralLoader(Dataset):
             
             paths = natsorted(
                 list(glob.glob(os.path.join(self.root, "*.png"))) + \
-                list(glob.glob(os.path.join(self.root, "*.jpg")))
+                list(glob.glob(os.path.join(self.root, "*.jpg"))) + \
+                list(glob.glob(os.path.join(self.root, "*", "*.png"))) + \
+                list(glob.glob(os.path.join(self.root, "*", "*.jpg"))) # recursive search depth 1
             )
             self.scene_data = self._load_data_path(paths, num_samples=num_samples)
             

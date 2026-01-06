@@ -6,19 +6,19 @@ import os
 from tqdm.auto import tqdm
 from transformers import pipeline as transformers_pipeline
 
-from relighting.pipeline import CustomStableDiffusionControlNetInpaintPipeline
-from relighting.pipeline_inpaintonly import CustomStableDiffusionInpaintPipeline, CustomStableDiffusionXLInpaintPipeline
-from relighting.argument import SAMPLERS, VAE_MODELS, DEPTH_ESTIMATOR, get_control_signal_type
-from relighting.image_processor import (
+from .pipeline import CustomStableDiffusionControlNetInpaintPipeline
+from .pipeline_inpaintonly import CustomStableDiffusionInpaintPipeline, CustomStableDiffusionXLInpaintPipeline
+from .argument import SAMPLERS, VAE_MODELS, DEPTH_ESTIMATOR, get_control_signal_type
+from .image_processor import (
     estimate_scene_depth,
     estimate_scene_normal,
     merge_normal_map,
     fill_depth_circular
 )
-from relighting.ball_processor import get_ideal_normal_ball, crop_ball
+from .ball_processor import get_ideal_normal_ball, crop_ball
 import pickle
 
-from relighting.pipeline_xl import CustomStableDiffusionXLControlNetInpaintPipeline
+from .pipeline_xl import CustomStableDiffusionXLControlNetInpaintPipeline
 
 class NoWaterMark:
     def apply_watermark(self, *args, **kwargs):
@@ -30,10 +30,33 @@ class ControlSignalGenerator():
         self.control_signal_type = control_signal_type
         self.device = device
 
+    def _to_pil(self, image):
+        if isinstance(image, Image.Image):
+            return image
+        if isinstance(image, torch.Tensor):
+            tensor = image.detach()
+            if tensor.dim() == 4:
+                if tensor.shape[0] != 1:
+                    raise ValueError("Only batch size 1 is supported for control signal inputs.")
+                tensor = tensor[0]
+            if tensor.dim() == 3 and tensor.shape[0] in [1, 3, 4]:
+                tensor = tensor[:3, :, :]
+                tensor = tensor.permute(1, 2, 0)
+            elif tensor.dim() == 3 and tensor.shape[-1] in [1, 3, 4]:
+                tensor = tensor[:, :, :3]
+            else:
+                raise ValueError("Unsupported tensor shape for control signal input.")
+
+            tensor = tensor.float().clamp(0, 1)
+            array = (tensor.cpu().numpy() * 255.0).astype(np.uint8)
+            return Image.fromarray(array)
+        raise TypeError("Unsupported image type for control signal generation.")
+
     def process_sd_depth(self, input_image, normal_ball=None, mask_ball=None, x=None, y=None, r=None):
         if getattr(self, 'depth_estimator', None) is None:
             self.depth_estimator = transformers_pipeline("depth-estimation", device=self.device.index)
 
+        input_image = self._to_pil(input_image)
         control_image = self.depth_estimator(input_image)['depth']
         control_image = np.array(control_image)
         control_image = control_image[:, :, None]
@@ -47,6 +70,7 @@ class ControlSignalGenerator():
         if getattr(self, 'depth_estimator', None) is None:
             self.depth_estimator = transformers_pipeline("depth-estimation", model=DEPTH_ESTIMATOR, device=self.device.index)
 
+        input_image = self._to_pil(input_image)
         control_image = estimate_scene_depth(input_image, depth_estimator=self.depth_estimator)
         xs = [x] if not isinstance(x, list) else x
         ys = [y] if not isinstance(y, list) else y
@@ -61,6 +85,7 @@ class ControlSignalGenerator():
         if getattr(self, 'depth_estimator', None) is None:
             self.depth_estimator = transformers_pipeline("depth-estimation", model=DEPTH_ESTIMATOR, device=self.device.index)
 
+        input_image = self._to_pil(input_image)
         normal_scene = estimate_scene_normal(input_image, depth_estimator=self.depth_estimator)
         normal_image = merge_normal_map(normal_scene, normal_ball, mask_ball, x, y)
         normal_image = (normal_image * 127.5 + 127.5).clip(0, 255).astype(np.uint8)
@@ -752,4 +777,3 @@ class BallInpainter():
 
         return output_image
     
-

@@ -1,18 +1,16 @@
-import os
 from typing import Dict, Iterable, Optional, Tuple, Union
 
+import os
 import torch
-from PIL import Image
+import torch.nn.functional as F
 
-from relighting.argument import CONTROLNET_MODELS, SD_MODELS
-from relighting.ball_processor import get_ideal_normal_ball
-from relighting.image_processor import pil_square_image
-from relighting.inpainter_2lora import BallInpainter
-from relighting.mask_utils import MaskGenerator
-from relighting.utils import name2hash
-import relighting.dist_utils as dist_util
+from ..relighting.argument import CONTROLNET_MODELS, SD_MODELS
+from ..relighting.ball_processor import get_ideal_normal_ball
+from ..relighting.inpainter_2lora import BallInpainter
+from ..relighting.utils import name2hash
+from ..relighting import dist_utils as dist_util
 
-ImageInput = Union[str, os.PathLike, Image.Image]
+ImageInput = torch.Tensor
 
 
 class DiffusionLightInpaintWrapper:
@@ -22,9 +20,9 @@ class DiffusionLightInpaintWrapper:
         use_controlnet: bool = True,
         use_lora: bool = True,
         lora_scale: float = 0.75,
-        exposure_lora_path: str = "models/ThisIsTheFinal-lora-hdr-continuous-largeT@900/0_-5/checkpoint-2500",
+        exposure_lora_path: str = os.path.join(os.path.dirname(os.path.dirname(__file__)), "models/ThisIsTheFinal-lora-hdr-continuous-largeT@900/0_-5/checkpoint-2500"),
         exposure_lora_scale: float = 0.75,
-        turbo_lora_path: str = "models/rev3/Flickr2K/Flickr2kPlus_extended/checkpoint-230000",
+        turbo_lora_path: str = os.path.join(os.path.dirname(os.path.dirname(__file__)), "models/rev3/Flickr2K/Flickr2kPlus_extended/checkpoint-230000"),
         turbo_lora_scale: float = 1.0,
         img_width: int = 1024,
         img_height: int = 1024,
@@ -49,7 +47,6 @@ class DiffusionLightInpaintWrapper:
         self.torch_dtype = torch.float32 if self.device.type == "cpu" else torch.float16
 
         self.pipe = self._create_pipe(offload=offload)
-        self.mask_generator = MaskGenerator()
         self._active_lora = None
 
         if self.use_lora:
@@ -99,19 +96,22 @@ class DiffusionLightInpaintWrapper:
             raise ValueError(
                 "sdedit_timestep is only supported with algorithm='normal' or 'turbo_swapping'"
             )
-        input_image, image_id = self._prepare_image(image)
+        input_image = self._prepare_image(image)
+        image_id = None
         seed = self._resolve_seed(seed, seed_key=seed_key or image_id)
 
+        image_size = self._get_image_size(input_image)
         x, y, r = self._get_ball_location(
-            input_image.size, ball_size=ball_size, ball_dilate=ball_dilate
+            image_size, ball_size=ball_size, ball_dilate=ball_dilate
         )
         normal_ball, mask_ball = get_ideal_normal_ball(size=ball_size + ball_dilate)
-        mask = self.mask_generator.generate_single(
+        mask = self._create_mask(
             input_image,
             mask_ball,
-            x - (ball_dilate // 2),
-            y - (ball_dilate // 2),
-            r + ball_dilate,
+            x,
+            y,
+            r,
+            ball_dilate,
         )
 
         embeddings = self._interpolate_embeddings(
@@ -150,8 +150,8 @@ class DiffusionLightInpaintWrapper:
                 "strength": base_strength,
                 "current_seed": seed,
                 "controlnet_conditioning_scale": control_scale,
-                "height": input_image.size[1],
-                "width": input_image.size[0],
+                "height": image_size[1],
+                "width": image_size[0],
                 "normal_ball": normal_ball,
                 "mask_ball": mask_ball,
                 "x": x,
@@ -281,24 +281,59 @@ class DiffusionLightInpaintWrapper:
         except Exception:
             pass
 
-    def _prepare_image(self, image: ImageInput) -> Tuple[Image.Image, Optional[str]]:
-        image_id = None
-        if isinstance(image, (str, os.PathLike)):
-            image_id = os.fspath(image)
-            image = Image.open(image_id).convert("RGB")
-        elif not isinstance(image, Image.Image):
-            raise TypeError("image must be a path or PIL.Image")
+    def _prepare_image(self, image: ImageInput) -> torch.Tensor:
+        if not isinstance(image, torch.Tensor):
+            raise TypeError("image must be a torch.Tensor")
+        if image.device != self.device:
+            if image.device.type == self.device.type and self.device.index is None:
+                self.device = image.device
+            else:
+                raise ValueError(
+                    "Input tensor device does not match wrapper device. "
+                    "Create the wrapper with device=image.device."
+                )
+        return self._prepare_tensor_image(image)
 
-        target_width = self.img_width or image.size[0]
-        target_height = self.img_height or image.size[1]
-        target_size = (target_width, target_height)
+    def _prepare_tensor_image(self, image: torch.Tensor) -> torch.Tensor:
+        if image.dim() == 3:
+            if image.shape[0] in [1, 3, 4]:
+                image = image.unsqueeze(0)
+            elif image.shape[-1] in [1, 3, 4]:
+                image = image.permute(2, 0, 1).unsqueeze(0)
+            else:
+                raise ValueError("Unsupported tensor shape for image input.")
+        elif image.dim() == 4:
+            if image.shape[0] != 1:
+                raise ValueError("Only batch size 1 is supported.")
+            if image.shape[1] not in [1, 3, 4] and image.shape[-1] in [1, 3, 4]:
+                image = image.permute(0, 3, 1, 2)
+        else:
+            raise ValueError("Unsupported tensor dimensions for image input.")
+
+        image = image.to(device=self.device)
+        if not torch.is_floating_point(image):
+            image = image.float()
+        if image.shape[1] == 4:
+            image = image[:, :3, :, :]
+        elif image.shape[1] == 1:
+            image = image.repeat(1, 3, 1, 1)
+        if image.max() > 1.0:
+            image = image / 255.0
+
+        target_width = self.img_width or image.shape[-1]
+        target_height = self.img_height or image.shape[-2]
 
         if self.force_square:
-            image = pil_square_image(image, desired_size=target_size)
-        elif target_size != image.size:
-            image = image.resize(target_size)
+            image = self._pad_resize_tensor(image, target_height, target_width)
+        elif (image.shape[-2], image.shape[-1]) != (target_height, target_width):
+            image = F.interpolate(
+                image,
+                size=(target_height, target_width),
+                mode="bilinear",
+                align_corners=False,
+            )
 
-        return image, image_id
+        return image
 
     def _get_ball_location(
         self, image_size: Tuple[int, int], ball_size: int, ball_dilate: int
@@ -319,6 +354,51 @@ class DiffusionLightInpaintWrapper:
             y = img_height - r - half_dilate
 
         return x, y, r
+
+    def _get_image_size(self, image: ImageInput) -> Tuple[int, int]:
+        return int(image.shape[-1]), int(image.shape[-2])
+
+    def _pad_resize_tensor(self, image: torch.Tensor, target_h: int, target_w: int) -> torch.Tensor:
+        _, _, h, w = image.shape
+        if (h, w) == (target_h, target_w):
+            return image
+        scale = min(target_w / w, target_h / h)
+        new_w = max(1, int(w * scale))
+        new_h = max(1, int(h * scale))
+        resized = F.interpolate(image, size=(new_h, new_w), mode="bilinear", align_corners=False)
+        canvas = torch.zeros(
+            (1, image.shape[1], target_h, target_w),
+            device=image.device,
+            dtype=image.dtype,
+        )
+        top = (target_h - new_h) // 2
+        left = (target_w - new_w) // 2
+        canvas[:, :, top : top + new_h, left : left + new_w] = resized
+        return canvas
+
+    def _create_mask(
+        self,
+        image: ImageInput,
+        mask_ball,
+        x: int,
+        y: int,
+        r: int,
+        ball_dilate: int,
+    ):
+        size = r + ball_dilate
+        mask_x = x - (ball_dilate // 2)
+        mask_y = y - (ball_dilate // 2)
+        height, width = int(image.shape[-2]), int(image.shape[-1])
+        mask = torch.zeros(
+            (1, 1, height, width),
+            device=image.device,
+            dtype=image.dtype,
+        )
+        mask_ball_t = torch.from_numpy(mask_ball.astype("float32")).to(
+            device=image.device, dtype=image.dtype
+        )
+        mask[:, :, mask_y : mask_y + size, mask_x : mask_x + size] = mask_ball_t
+        return mask
 
     def _resolve_seed(self, seed: Union[int, str], seed_key: Optional[str] = None) -> int:
         if seed == "auto":

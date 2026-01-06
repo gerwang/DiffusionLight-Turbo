@@ -6,7 +6,7 @@ import numpy as np
 from pathlib import Path
 from natsort import natsorted
 from PIL import Image
-from relighting.image_processor import pil_square_image
+from .image_processor import pil_square_image
 from tqdm.auto import tqdm
 import random
 import itertools

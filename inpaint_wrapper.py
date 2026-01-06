@@ -76,7 +76,7 @@ class DiffusionLightInpaintWrapper:
         denoising_step: int = 30,
         control_scale: float = 0.5,
         algorithm: str = "turbo_swapping",
-        strength: float = 0.8,
+        strength: Optional[float] = None,
         switch_lora_timestep: int = 800,
         num_iteration: int = 2,
         ball_per_iteration: int = 30,
@@ -88,11 +88,17 @@ class DiffusionLightInpaintWrapper:
         max_negative_ev: float = -5.0,
         guidance_scale: float = 5.0,
         return_square: bool = False,
+        sdedit_timestep: Optional[Union[int, float]] = None,
+        sdedit_timestep_is_index: bool = False,
     ):
         if ball_dilate % 2 != 0:
             raise ValueError("ball_dilate must be an even number")
 
         algorithm = self._normalize_algorithm(algorithm)
+        if sdedit_timestep is not None and algorithm not in ["normal", "turbo_swapping"]:
+            raise ValueError(
+                "sdedit_timestep is only supported with algorithm='normal' or 'turbo_swapping'"
+            )
         input_image, image_id = self._prepare_image(image)
         seed = self._resolve_seed(seed, seed_key=seed_key or image_id)
 
@@ -122,6 +128,16 @@ class DiffusionLightInpaintWrapper:
             elif self.use_lora:
                 self._load_exposure_lora()
 
+            base_strength = 1.0
+            if sdedit_timestep is not None:
+                base_strength = self._strength_from_timestep(
+                    sdedit_timestep,
+                    denoising_step,
+                    timestep_is_index=sdedit_timestep_is_index,
+                )
+            elif algorithm in ["normal", "turbo_swapping"] and strength is not None:
+                base_strength = strength
+
             generator = torch.Generator().manual_seed(seed)
             kwargs = {
                 "prompt_embeds": prompt_embeds,
@@ -131,7 +147,7 @@ class DiffusionLightInpaintWrapper:
                 "generator": generator,
                 "image": input_image,
                 "mask_image": mask,
-                "strength": 1.0,
+                "strength": base_strength,
                 "current_seed": seed,
                 "controlnet_conditioning_scale": control_scale,
                 "height": input_image.size[1],
@@ -150,9 +166,10 @@ class DiffusionLightInpaintWrapper:
             if algorithm == "normal":
                 output_image = self.pipe.inpaint(**kwargs).images[0]
             elif algorithm == "iterative":
+                iter_strength = 0.8 if strength is None else strength
                 kwargs.update(
                     {
-                        "strength": strength,
+                        "strength": iter_strength,
                         "num_iteration": num_iteration,
                         "ball_per_iteration": ball_per_iteration,
                         "agg_mode": agg_mode,
@@ -164,9 +181,10 @@ class DiffusionLightInpaintWrapper:
             elif algorithm in ["turbo_sdedit", "turbo_pred"]:
                 if algorithm == "turbo_pred":
                     enable_acceleration = True
+                iter_strength = 0.8 if strength is None else strength
                 kwargs.update(
                     {
-                        "strength": strength,
+                        "strength": iter_strength,
                         "num_iteration": num_iteration,
                         "ball_per_iteration": ball_per_iteration,
                         "agg_mode": agg_mode,
@@ -308,6 +326,31 @@ class DiffusionLightInpaintWrapper:
                 return name2hash(seed_key)
             return 0
         return int(seed)
+
+    def _strength_from_timestep(
+        self,
+        noise_timestep: Union[int, float],
+        num_inference_steps: int,
+        timestep_is_index: bool = False,
+    ) -> float:
+        if num_inference_steps <= 0:
+            raise ValueError("num_inference_steps must be > 0")
+
+        scheduler = self.pipe.pipeline.scheduler
+        scheduler.set_timesteps(num_inference_steps, device=self.device)
+        timesteps = scheduler.timesteps.detach().cpu()
+
+        if timestep_is_index:
+            idx = int(noise_timestep)
+            if idx < 0 or idx >= len(timesteps):
+                raise ValueError("noise_timestep index is out of range")
+        else:
+            target = float(noise_timestep)
+            idx = int((timesteps - target).abs().argmin().item())
+
+        init_timestep = len(timesteps) - idx
+        strength = init_timestep / len(timesteps)
+        return min(max(strength, 0.0), 1.0)
 
     def _encode_prompt(self, prompt: str):
         try:

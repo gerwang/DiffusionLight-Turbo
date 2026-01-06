@@ -343,8 +343,10 @@ class BallInpainter():
         return control_image
 
     def prepare_control_signal(self, image, controlnet_conditioning_scale, extra_kwargs):
-        if self.control_generator is not None:
+        control_image = extra_kwargs.get("control_image")
+        if control_image is None and self.control_generator is not None:
             control_image = self.control_generator(image, **extra_kwargs)
+        if control_image is not None:
             controlnet_kwargs = {
                 "control_image": control_image,
                 "controlnet_conditioning_scale": controlnet_conditioning_scale
@@ -539,6 +541,8 @@ class BallInpainter():
         exposure_lora_path="models/ThisIsTheFinal-lora-hdr-continuous-largeT@900/0_-5/checkpoint-2500",
         exposure_lora_scale=0.75,
         switch_lora_timestep=800,
+        output_type: str = "pil",
+        return_dict: bool = True,
         **extra_kwargs,
     ):
         height, width = self._default_height_width(height, width)
@@ -575,6 +579,8 @@ class BallInpainter():
             switch_lora_timestep=switch_lora_timestep,
             switch_lora_path=exposure_lora_path,
             switch_lora_scale=exposure_lora_scale,
+            output_type=output_type,
+            return_dict=return_dict,
             **controlnet_kwargs
         )
 
@@ -740,6 +746,8 @@ class BallInpainter():
         prompt_embeds=None,
         pooled_prompt_embeds=None,
         guidance_scale=5.0,
+        output_type: str = "pil",
+        return_dict: bool = True,
         **extra_kwargs,
     ):
         height, width = self._default_height_width(height, width)
@@ -772,6 +780,8 @@ class BallInpainter():
             prompt_embeds=prompt_embeds,
             pooled_prompt_embeds=pooled_prompt_embeds,
             guidance_scale=guidance_scale,
+            output_type=output_type,
+            return_dict=return_dict,
             **controlnet_kwargs
         )
 

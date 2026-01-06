@@ -1,8 +1,10 @@
 from typing import Dict, Iterable, Optional, Tuple, Union
 
 import os
+import numpy as np
 import torch
 import torch.nn.functional as F
+from PIL import Image
 
 from ..relighting.argument import CONTROLNET_MODELS, SD_MODELS
 from ..relighting.ball_processor import get_ideal_normal_ball
@@ -60,6 +62,52 @@ class DiffusionLightInpaintWrapper:
             except Exception:
                 pass
 
+    def prepare_aux(
+        self,
+        image: ImageInput,
+        ball_size: int = 256,
+        ball_dilate: int = 20,
+    ) -> Dict[str, object]:
+        if ball_dilate % 2 != 0:
+            raise ValueError("ball_dilate must be an even number")
+
+        input_image = self._prepare_image(image)
+        image_size = self._get_image_size(input_image)
+        x, y, r = self._get_ball_location(
+            image_size, ball_size=ball_size, ball_dilate=ball_dilate
+        )
+        normal_ball, mask_ball = get_ideal_normal_ball(size=ball_size + ball_dilate)
+        mask = self._create_mask(
+            input_image,
+            mask_ball,
+            x,
+            y,
+            r,
+            ball_dilate,
+        )
+
+        control_image = None
+        if self.use_controlnet and self.pipe.control_generator is not None:
+            control_image = self.pipe.control_generator(
+                input_image,
+                normal_ball=normal_ball,
+                mask_ball=mask_ball,
+                x=x,
+                y=y,
+                r=r,
+            )
+            control_image = self._control_to_tensor(control_image)
+
+        return {
+            "mask": mask,
+            "normal_ball": normal_ball,
+            "mask_ball": mask_ball,
+            "x": x,
+            "y": y,
+            "r": r,
+            "control_image": control_image,
+        }
+
     def inpaint(
         self,
         image: ImageInput,
@@ -68,6 +116,8 @@ class DiffusionLightInpaintWrapper:
         negative_prompt: str = "matte, diffuse, flat, dull",
         ball_size: int = 256,
         ball_dilate: int = 20,
+        aux_inputs: Optional[Dict[str, object]] = None,
+        output_type: str = "pil",
         seed: Union[int, str] = 0,
         seed_key: Optional[str] = None,
         denoising_step: int = 30,
@@ -88,9 +138,6 @@ class DiffusionLightInpaintWrapper:
         sdedit_timestep: Optional[Union[int, float]] = None,
         sdedit_timestep_is_index: bool = False,
     ):
-        if ball_dilate % 2 != 0:
-            raise ValueError("ball_dilate must be an even number")
-
         algorithm = self._normalize_algorithm(algorithm)
         if sdedit_timestep is not None and algorithm not in ["normal", "turbo_swapping"]:
             raise ValueError(
@@ -100,19 +147,59 @@ class DiffusionLightInpaintWrapper:
         image_id = None
         seed = self._resolve_seed(seed, seed_key=seed_key or image_id)
 
+        use_torch_output = output_type == "pt"
+        pipe_output_type = "latent" if use_torch_output else output_type
+
         image_size = self._get_image_size(input_image)
-        x, y, r = self._get_ball_location(
-            image_size, ball_size=ball_size, ball_dilate=ball_dilate
-        )
-        normal_ball, mask_ball = get_ideal_normal_ball(size=ball_size + ball_dilate)
-        mask = self._create_mask(
-            input_image,
-            mask_ball,
-            x,
-            y,
-            r,
-            ball_dilate,
-        )
+        if aux_inputs is None:
+            if ball_dilate % 2 != 0:
+                raise ValueError("ball_dilate must be an even number")
+            x, y, r = self._get_ball_location(
+                image_size, ball_size=ball_size, ball_dilate=ball_dilate
+            )
+            normal_ball, mask_ball = get_ideal_normal_ball(size=ball_size + ball_dilate)
+            mask = self._create_mask(
+                input_image,
+                mask_ball,
+                x,
+                y,
+                r,
+                ball_dilate,
+            )
+            control_image = None
+        else:
+            x = aux_inputs.get("x")
+            y = aux_inputs.get("y")
+            r = aux_inputs.get("r")
+            normal_ball = aux_inputs.get("normal_ball")
+            mask_ball = aux_inputs.get("mask_ball")
+            mask = aux_inputs.get("mask")
+            control_image = aux_inputs.get("control_image")
+            if (
+                x is None
+                or y is None
+                or r is None
+                or normal_ball is None
+                or mask_ball is None
+                or mask is None
+            ):
+                if ball_dilate % 2 != 0:
+                    raise ValueError("ball_dilate must be an even number")
+                image_size = self._get_image_size(input_image)
+                x, y, r = self._get_ball_location(
+                    image_size, ball_size=ball_size, ball_dilate=ball_dilate
+                )
+                normal_ball, mask_ball = get_ideal_normal_ball(size=ball_size + ball_dilate)
+                mask = self._create_mask(
+                    input_image,
+                    mask_ball,
+                    x,
+                    y,
+                    r,
+                    ball_dilate,
+                )
+            elif mask.device != input_image.device:
+                mask = mask.to(device=input_image.device, dtype=input_image.dtype)
 
         embeddings = self._interpolate_embeddings(
             prompt=prompt,
@@ -159,6 +246,10 @@ class DiffusionLightInpaintWrapper:
                 "r": r,
                 "guidance_scale": guidance_scale,
             }
+            if control_image is not None:
+                kwargs["control_image"] = control_image
+            if algorithm in ["normal", "turbo_swapping"]:
+                kwargs["output_type"] = pipe_output_type
 
             if self.use_lora:
                 kwargs["cross_attention_kwargs"] = {"scale": self.lora_scale}
@@ -210,8 +301,19 @@ class DiffusionLightInpaintWrapper:
             else:
                 raise NotImplementedError(f"Unknown algorithm {algorithm}")
 
+            if use_torch_output:
+                if not isinstance(output_image, torch.Tensor):
+                    raise RuntimeError(
+                        "output_type='pt' requires latent tensor output. "
+                        "Use algorithm='normal' or 'turbo_swapping'."
+                    )
+                output_image = self._decode_latents_to_torch(output_image)
+                output_image = self._to_hwc(output_image)
             if return_square:
-                square_image = output_image.crop((x, y, x + r, y + r))
+                if isinstance(output_image, torch.Tensor):
+                    square_image = output_image[y : y + r, x : x + r, :]
+                else:
+                    square_image = output_image.crop((x, y, x + r, y + r))
                 outputs[ev_value] = (output_image, square_image)
             else:
                 outputs[ev_value] = output_image
@@ -375,6 +477,48 @@ class DiffusionLightInpaintWrapper:
         left = (target_w - new_w) // 2
         canvas[:, :, top : top + new_h, left : left + new_w] = resized
         return canvas
+
+    def _control_to_tensor(self, control_image: object) -> Optional[torch.Tensor]:
+        if control_image is None:
+            return None
+        if isinstance(control_image, torch.Tensor):
+            tensor = control_image
+        elif isinstance(control_image, Image.Image):
+            array = np.asarray(control_image).astype(np.float32) / 255.0
+            if array.ndim == 2:
+                array = np.repeat(array[:, :, None], 3, axis=2)
+            if array.shape[2] == 1:
+                array = np.repeat(array, 3, axis=2)
+            tensor = torch.from_numpy(array)
+        else:
+            raise TypeError("Unsupported control_image type for tensor conversion.")
+
+        if tensor.dim() == 3 and tensor.shape[-1] in [1, 3, 4]:
+            tensor = tensor[:, :, :3].permute(2, 0, 1).unsqueeze(0)
+        elif tensor.dim() == 3 and tensor.shape[0] in [1, 3, 4]:
+            tensor = tensor[:3, :, :].unsqueeze(0)
+        elif tensor.dim() == 4 and tensor.shape[1] in [1, 3, 4]:
+            tensor = tensor[:, :3, :, :]
+        else:
+            raise ValueError("Unsupported control_image tensor shape.")
+
+        tensor = tensor.to(device=self.device, dtype=self.torch_dtype)
+        return tensor
+
+    def _decode_latents_to_torch(self, latents: torch.Tensor) -> torch.Tensor:
+        if latents.dim() == 3:
+            latents = latents.unsqueeze(0)
+        vae = self.pipe.pipeline.vae
+        image = vae.decode(latents / vae.config.scaling_factor, return_dict=False)[0]
+        image = (image / 2 + 0.5).clamp(0.0, 1.0)
+        return image.float()
+
+    def _to_hwc(self, image: torch.Tensor) -> torch.Tensor:
+        if image.dim() == 4:
+            image = image[0]
+        if image.dim() == 3 and image.shape[0] in [1, 3, 4]:
+            image = image[:3, :, :].permute(1, 2, 0)
+        return image
 
     def _create_mask(
         self,
